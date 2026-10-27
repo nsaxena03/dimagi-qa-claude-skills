@@ -1,0 +1,22 @@
+# Where a prod smoke run may write (create, edit, delete, submit).
+# Anything else on these hosts is aborted in the browser and the case marked
+# Blocking. Add an org only when Nitin says so.
+hosts:
+  connect.dimagi.com: [pm_automation_01, network-manager, program-manager-prod, network-manager-prod]
+  www.commcarehq.org: &hq [connectqa-automation-prod, qateam, casesearch]
+  commcarehq.org: *hq
+
+# Any other host under these domains is prod too: writes to it are blocked.
+guarded_suffixes: [dimagi.com, commcarehq.org]
+
+# Login and OAuth endpoints carry no org in the URL. Exact paths only:
+# broader prefixes (/accounts/, /o/) also cover email, password and OAuth-app
+# management on the shared QA account.
+auth_path_prefixes:
+  - /accounts/login/
+  - /accounts/logout/
+  - /accounts/commcarehq/
+  - /oauth/authorize/
+  - /oauth/token/
+  - /o/authorize/
+  - /o/token/

@@ -1,0 +1,216 @@
+---
+name: qa-run-test-plan
+description: Use when asked to execute an existing QA test plan against a deployed environment - "run the test plan for CCCT-1234", "verify CCCT-1234 on staging", "are the changes working", "automate and run these test cases", "check the plan passes". Automates every case it can, runs them on staging, writes results back into the workbook, and hands the rest to a tester. Pairs with qa-ticket-prep, which writes the plan this skill runs.
+---
+
+# QA Run Test Plan
+
+## Overview
+
+Takes a test plan written by `qa-ticket-prep` and executes it against a deployed
+environment. Automates whatever can be automated, records a verdict with evidence
+for each case, and separates the remainder into *needs a human* and *needs data*
+so nobody wastes time trying to run a case that cannot be run.
+
+**The deliverable is a verdict on the feature, not a green suite.** A run that
+passes 24 cases while quietly skipping the one that mattered is a failure of this
+skill. Say what was proved, what was not, and how confident you are.
+
+## The three buckets
+
+Every case in the plan ends in exactly one of these. Getting this split right is
+most of the value.
+
+| Bucket | Status | How it is marked |
+|---|---|---|
+| Automated and run | Pass / Fail | Evidence line describing what was observed |
+| Cannot be automated | Blocking | `RUN BY HAND - <why>` — a tester picks these up |
+| Environment lacks the data | Blocking | `NEEDS TEST DATA - <why>. Unblocked by: <what>` |
+
+**The plan already carries the first split.** `qa-ticket-prep` writes an
+**Automatable** column (Yes / No). `TestPlan` reads it and
+`runner.adopt_plan(plan)` marks every **No** as one for a tester and returns the
+rest, so a run only writes checks for the Yes rows:
+
+```python
+plan = TestPlan("CCCT-2771_..._Test_Plan.xlsx")
+todo = runner.adopt_plan(plan)   # No rows -> RUN BY HAND; returns the Yes ids
+```
+
+If a case marked Yes turns out genuinely impossible, `skip_manual` it and say so
+in the report — the plan's column was wrong and should be corrected. Do not
+quietly widen that bucket: "hard to automate" is not "cannot be automated", and
+the skill's job is to do the hard one. Real screen reader announcements, browser
+engines you do not have, and genuine visual judgement are the whole list.
+
+A plan with no Automatable column (written before this column existed) loads with
+every case treated as automatable, and `TestPlan` says so.
+
+## Workflow
+
+### Step 1 — Locate the plan and the change
+
+- Find the workbook (`<TICKET>_*_Test_Plan.xlsx`) and load it with `TestPlan`,
+  which finds its columns by header name. Case ids live in column A;
+  Status, Comments and Automatable (last) follow Expected Outcome. Older plans
+  have Automatable before Status, and both load the same. The last tab,
+  `Master Plan Cases`, is the proposal for the master test plan. Don't run it:
+  its `Status (Pass/Fail)` header keeps `TestPlan` from treating it as cases.
+- Read the Jira ticket and find the PRs (`gh pr list --search "<TICKET>"`).
+  Note any that are unmerged and whether they are stacked.
+- Skim the diff for what the cases are actually guarding. You need this in
+  Step 5 to tell a real failure from a wrong expectation.
+
+### Step 2 — Probe the build before anything else
+
+Log in, reach the feature, and confirm the change is actually deployed — look for
+a control or element the PR introduced.
+
+**If it is not there, stop and report that.** Do not write automation against a
+build that does not have the feature. An hour spent discovering this late is an
+hour wasted.
+
+### Step 3 — Inventory the data, and reconcile it against the plan *first*
+
+This step is the one most often skipped and the one that pays best.
+
+Walk the feature's data — every row, across every page, not just page one — and
+build an inventory: statuses present, date spread, which fields are populated,
+which are null.
+
+Then go through the plan's prerequisites and decide, **before writing a single
+assertion**, which cases the data can and cannot support. Mark the unsupported
+ones with `skip_data` immediately.
+
+Two things fall out of doing this first:
+
+- You report the data gap in the first ten minutes instead of at the end.
+- **The plan's own prerequisites are often wrong.** They were written from the
+  diff by someone who had not seen the environment. On CCCT-2771 the plan asked
+  for invoices numbered `INV-AUG-01` and `INV/SEP 01`; the product generates
+  invoice numbers itself and the field is read-only, so those rows were
+  unusable. Say so, correct the plan, do not quietly work around it.
+
+Also check whether the data actually *discriminates* — see "Assertions must
+discriminate" below.
+
+### Step 4 — Discovery pass, then write the checks
+
+Before writing assertions, dump the real structure of the page: control names,
+form actions and their hidden inputs, checkbox attributes, chip/tab markup, how
+the pager works. Write it to a file and read it.
+
+Guessing selectors is the single largest source of wasted runs. Look them up.
+
+Then write one isolated function per case using `references/qa_runner.py`.
+
+### Step 5 — Run, then triage every failure before reporting it
+
+A failing check is **not** a product bug until you have shown it is one. On the
+first CCCT-2771 run, 8 cases "failed" and every one was the harness: guessed
+selectors, a case-sensitive regex against CSS-uppercased text, an Alpine dropdown
+that does not close on Escape, `page.goto` on a download URL.
+
+For each failure ask, in order:
+
+1. Is my selector right? (Check the discovery dump.)
+2. Is my *expectation* right? On CCCT-2771 a count of 23 looked wrong against a
+   header saying 25 — the app was correct and the check was wrong, because two
+   invoices were genuinely excluded by status. **When the app disagrees with
+   you, verify your expectation against data you scraped yourself before calling
+   it a bug.**
+3. Only then: is the product wrong?
+
+Report a failure with the screenshot and the exact observed text.
+
+### Step 6 — Write back and report
+
+- `runner.write_workbook(plan_path)` — writes to a **dated copy**, never the
+  original, because a tester may have been filling the original in by hand.
+- Report: the count, what the strongest evidence was, any product questions the
+  run surfaced, the cases for a tester, the cases waiting on data and exactly
+  what data would unblock them.
+- State confidence honestly (see below).
+
+## Assertions must discriminate
+
+An assertion that would pass whether or not the code works is not a test.
+
+On CCCT-2771 every invoice was 500.00 INR / 5.27 USD, so the selection-total
+check confirmed `2 × 5.27 = 10.54` — which would also have passed if the code had
+summed the wrong two rows. Similarly, with only one month of data, "the latest
+month is selected by default" and "a bad URL falls back to the latest month" are
+near-vacuous: there is only one month it could pick.
+
+When the data cannot discriminate, **say so in the evidence line** rather than
+banking a clean pass. Prefer, where you can:
+
+- values that differ between rows, so a total can only come out right one way
+- a count cross-checked against rows you scraped yourself, not only against the
+  number the app prints
+- a comparison against a known-good artifact (an existing download, the previous
+  page's content) rather than against a hard-coded literal
+
+## Reporting confidence
+
+End with a split: the cases whose assertions compare against independently
+derived ground truth, and the cases that passed but whose data made them weak.
+Name the weak ones and why. A bare "24 passed" invites a trust it has not earned.
+
+Also state plainly what was never checked at all — visual layout, other browsers,
+anything the run did not touch.
+
+## Standing permissions
+
+Agreed with the user, so do not ask each run:
+
+- **Logging into staging** from the repo's `settings.cfg` and **downloading
+  export files**: allowed.
+- **Creating test data**: always ask first. Report what is missing and what it
+  would unblock; let the user decide whether it is worth seeding.
+- **Writing results**: to a dated copy only, never the original workbook.
+- **Pushing anything**: never, unless told to at that moment.
+
+## Environment
+
+- Credentials come from `dimagi-qa-ccc/settings.cfg` via `SettingsLoader`. The
+  harness never handles a password directly.
+- `QA_CCC_REPO` overrides the QA repo path (default
+  `C:\Users\DIMAGI\PythonScripts\dimagi-qa-ccc`).
+- Needs `playwright` (+ installed browsers), `openpyxl`, and `pypdf` for cases
+  that read PDFs.
+- The session is cached to `~/.qa_runner/storage_state_<env>.json`. One OAuth
+  covers many runs; pass `fresh=True` when it expires.
+- Default env is `stage` (`connect-staging.dimagi.com`).
+- The progress toast only behaves realistically where a background worker is
+  running. If an export completes instantly, say the async path was not exercised.
+
+## Harness
+
+`references/qa_runner.py` — `ConnectSession` (login + cached session),
+`CaseRunner` (`run` / `skip_manual` / `skip_data` / `not_applicable`,
+screenshot-on-fail, `print_summary`, `write_workbook`), plus
+`download_via_progress_toast`, `download_via_navigation`, `scrape_table` and
+`go_to_page`.
+
+`references/prod_guard.py` — the prod write guard used by `qa-prod-smoke`;
+inert unless passed to `ConnectSession` / `CaseRunner`.
+
+See `references/worked_example.md` for the CCCT-2771 run these were extracted
+from, including the gotchas that cost a run each.
+
+## Common mistakes
+
+- **Writing automation before checking the build is deployed.** Step 2 first.
+- **Discovering the data gap at the end.** Step 3 before any assertion.
+- **Trusting the plan's prerequisites.** They were written without seeing the
+  environment. Reconcile, then correct the plan.
+- **Reporting your own broken check as a product bug.** Triage first, every time.
+- **Guessing selectors.** Do the discovery pass and read it.
+- **Banking a pass from data that could not have failed.** Flag it instead.
+- **Overwriting the tester's workbook.** Dated copy, always.
+- **Lumping "needs a screen reader" together with "needs an invoice".** One needs
+  a person, the other needs data. The user schedules them differently.
+- **Marking a case not automatable because its data is missing.** Those are
+  different axes. The Automatable column is about whether a machine could ever
+  judge it; `skip_data` is about whether it can today.

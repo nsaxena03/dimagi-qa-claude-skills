@@ -1,0 +1,150 @@
+---
+name: qa-prod-smoke
+description: Use after a ticket's PR is deployed to Connect web production, to run a quick smoke / sanity pass on prod - "CCCT-1234 is on prod, run the smoke", "prod smoke for X", "smoke test the deploy", "sanity check X on prod after deploy". Picks a short list from the plan qa-ticket-prep already wrote, gets it approved, runs it on prod with writes locked to QA orgs, and reports. Pairs with qa-ticket-prep (writes the plan) and qa-run-test-plan (runs it on staging).
+---
+
+# QA Prod Smoke
+
+## Overview
+
+Staging already proved the details. On prod the questions are smaller: **is the
+feature live, does its main path work, does existing data still read correctly,
+and do the pages next to it still load?** This skill answers those with 8–15
+cases taken from the ticket's existing plan. It does not write a new plan.
+
+Prod has real programs and real people. Writes are allowed only inside the QA
+orgs, and that is enforced by code (`prod_guard`), not by care.
+
+## Workflow
+
+### Step 1 — Locate the plan and the change
+
+- Find `<TICKET>_*_Test_Plan.xlsx` and load it with `TestPlan`.
+- Read the ticket and find its PRs (`gh pr list --search "<TICKET>"`). Confirm
+  they are **merged**. An unmerged PR is not on prod — stop and say so.
+- Skim the diff for what the feature adds on screen; Step 2 looks for it.
+
+### Step 2 — Probe prod before anything else
+
+Log in to `connect.dimagi.com` (with the guard on — see "Running") and look for
+the control, page or column the PR introduced. **If it is not there, stop and
+report "not deployed to prod yet".** Nothing else runs.
+
+### Step 3 — Shortlist
+
+Only cases whose **Automatable** column is **Yes**. From those take:
+
+| Kind | What it is | How many |
+|---|---|---|
+| Feature is live | The new control / page / column is present | One per feature tab |
+| Main path works | The feature's primary flow end to end, including create/edit/delete when that is the flow | One (occasionally two) per feature tab |
+| Existing data reads correctly | "Existing data after deploy" / migration-effect cases. Worth more on prod than staging: prod has real older data | All that are UI-checkable |
+| Neighbours still load | Impact-area cases of the form "adjacent page still loads and shows its data" | The cheapest per neighbour |
+| Post-merge smoke | The Regression tab's post-merge smoke case | The one case |
+
+Leave out: negative and validation edge cases, role/permission combinations,
+browser/layout/accessibility sweeps, suspected-defect probes, and cases that
+need staging-only seeded data. Aim for 8–15; if the rules give more, keep one
+per kind per tab and say what was dropped.
+
+The plan's prerequisites describe staging. Re-map each shortlisted case onto
+prod QA data (Step 4) — never assume a staging fixture exists on prod.
+
+### Step 4 — Show the shortlist and wait
+
+Show a table: `id | title | kind | org it writes to, or "read-only" | ask-first?`.
+**Nothing runs on prod until Nitin approves it.** Mark any case needing an
+ask-first write (below) and get a yes for each one individually.
+
+### Step 5 — Run, then clean up
+
+Run the approved cases with the guard on. Name everything you create with
+`smoke_label(ticket)` and record it in a `CreatedLog`. When the run ends, delete
+what the UI lets you delete and `mark_deleted` it.
+
+Triage every failure the way `qa-run-test-plan` Step 5 says before calling it a
+product bug. Send each failure screenshot to Nitin as it happens.
+
+### Step 6 — Write back and report
+
+- `write_prod_results(runner, plan)` — a dated copy
+  `<plan>_prod_smoke_<date>.xlsx`, results in two new columns
+  `Prod Smoke Status` / `Prod Smoke Notes`. The staging Status and Comments
+  stay as they were.
+- Report: verdict (live and working / broken / not deployed), counts, the
+  strongest evidence, any `PROD GUARD` blocks, `log.leftovers()` with org and
+  name, and the cases handed to Nitin.
+
+## Running
+
+```python
+import sys; sys.path.insert(0, r"C:\Users\DIMAGI\.claude\skills\qa-prod-smoke\references")
+from prod_smoke import prod_guard, smoke_label, CreatedLog, write_prod_results
+from qa_runner import ConnectSession, CaseRunner, TestPlan
+
+guard = prod_guard()
+log = CreatedLog()
+with ConnectSession(env="prod", guard=guard).start(org="pm_automation_01") as page:
+    runner = CaseRunner(page, out_dir, guard=guard)
+    runner.run("TC-FT-001", lambda: check_feature_live(page))
+    ...
+runner.print_summary()
+write_prod_results(runner, plan)
+```
+
+- `ConnectSession(env="prod")` refuses to start without a guard.
+- The guard aborts, inside the browser, any create / edit / delete / submit on
+  Connect or HQ prod whose org or project is not in
+  `references/prod_allowlist.yaml`. The case becomes **Blocking —
+  `PROD GUARD: write outside QA org <slug>`**. That is a stop, not a puzzle:
+  report it. Never work around the guard, and add an org to the allowlist only
+  when Nitin says so.
+- Allowed today — Connect: `pm_automation_01`, `network-manager`,
+  `program-manager-prod`, `network-manager-prod`. HQ:
+  `connectqa-automation-prod`, `qateam`, `casesearch`.
+- Session state is cached to `~/.qa_runner/storage_state_prod.json`.
+- In prod case code, drive the UI only. Never add a `page.route` (it would
+  take precedence over the guard), and never write through `page.request` /
+  `context.request` (those calls are not routed at all).
+- Start each case from a `/a/<qa-org>/` page. Connect's org-less HTMX calls
+  are allowed only when the page they come from is a QA org's, so a case that
+  starts from the home page or org picker shows as `PROD GUARD` Blocking.
+- `runner.stray_violations` lists writes blocked outside any case (login,
+  setup). Include them in the report.
+
+## Ask-first writes
+
+These start inside a QA org but reach real people or teams. Each needs Nitin's
+yes for that specific case; without it, `skip_manual(case, "outward write")`.
+
+- email or SMS to real addresses
+- Finance tickets (on CCCT-2739, "send" opened a real one)
+- payments or invoices that reach finance
+- notifications to anyone outside the QA team
+
+## Prod test data
+
+Prefer what already exists over creating more. The prod fixtures are in
+`dimagi-qa-ccc/test_data/web_test_data.yaml` — **unsuffixed keys are prod**,
+`_staging` keys are staging (e.g. `TASKING.static_opp`, `static_opp_id`, the
+relearn worker and task type). Create a new opportunity only when the case is
+about creating one.
+
+## Standing permissions
+
+- Logging into prod with the `settings.cfg` account, and writes inside the
+  allowlisted QA orgs: allowed.
+- Ask-first writes, and changes to the allowlist: ask every time.
+- Writing results: dated copy only.
+- Pushing, posting to Jira: never, unless told to at that moment.
+
+## Common mistakes
+
+- **Running before the shortlist is approved.** Step 4 is a gate.
+- **Smoke-testing a PR that is not merged / deployed.** Steps 1–2 first.
+- **Copying staging prerequisites onto prod.** Re-map to prod QA data.
+- **Creating opportunities when a fixture would do.** Every one is left behind.
+- **Reporting a `PROD GUARD` block as a product bug.** It is the guard doing
+  its job; the case targeted a non-QA org or an org-less endpoint.
+- **Re-running staging's edge cases on prod.** That is the full plan, not a
+  smoke.

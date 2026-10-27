@@ -78,7 +78,8 @@ product bug. Send each failure screenshot to Nitin as it happens.
 ## Running
 
 ```python
-import sys; sys.path.insert(0, r"C:\Users\DIMAGI\.claude\skills\qa-prod-smoke\references")
+import sys; from pathlib import Path
+sys.path.insert(0, str(Path.home() / ".claude/skills/qa-prod-smoke/references"))
 from prod_smoke import prod_guard, smoke_label, CreatedLog, write_prod_results
 from qa_runner import ConnectSession, CaseRunner, TestPlan
 
